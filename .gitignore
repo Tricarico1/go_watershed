@@ -1,0 +1,19 @@
+# Create .gitignore file
+echo "# Build artifacts
+*.zip
+bootstrap
+main
+function.zip
+
+# Go build and test files
+*.exe
+*.test
+*.out
+*.o
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+" > .gitignorebootstrap
+main
