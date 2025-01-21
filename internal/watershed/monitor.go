@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/ses"
 )
 
@@ -68,11 +69,16 @@ func getThresholdFromEnv(measurement string) ThresholdConfig {
 }
 
 type Monitor struct {
+	s3Client      *s3.S3
+	bucketName    string
 	lastEmailSent map[string]time.Time
 }
 
 func NewMonitor() *Monitor {
+	sess := session.Must(session.NewSession())
 	return &Monitor{
+		s3Client:      s3.New(sess),
+		bucketName:    "watershed-monitor-state",
 		lastEmailSent: make(map[string]time.Time),
 	}
 }
@@ -281,7 +287,48 @@ func (m *Monitor) fetchTimeSeriesData(name, resultID string) error {
 	return nil
 }
 
+func (m *Monitor) loadState() error {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(m.bucketName),
+		Key:    aws.String("last_email_times.json"),
+	}
+
+	result, err := m.s3Client.GetObject(input)
+	if err != nil {
+		// It's ok if the file doesn't exist yet
+		return nil
+	}
+	defer result.Body.Close()
+
+	decoder := json.NewDecoder(result.Body)
+	return decoder.Decode(&m.lastEmailSent)
+}
+
+func (m *Monitor) saveState() error {
+	data, err := json.Marshal(m.lastEmailSent)
+	if err != nil {
+		return fmt.Errorf("error marshaling state: %v", err)
+	}
+
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(m.bucketName),
+		Key:    aws.String("last_email_times.json"),
+		Body:   bytes.NewReader(data),
+	}
+
+	_, err = m.s3Client.PutObject(input)
+	if err != nil {
+		return fmt.Errorf("error saving state to S3: %v", err)
+	}
+	return nil
+}
+
 func (m *Monitor) RunOnce() error {
+	// Load state at start
+	if err := m.loadState(); err != nil {
+		fmt.Printf("Warning: Could not load state: %v\n", err)
+	}
+
 	measurements, err := m.fetchResultID()
 	if err != nil {
 		return fmt.Errorf("error fetching measurements: %v", err)
@@ -303,6 +350,11 @@ func (m *Monitor) RunOnce() error {
 				fmt.Printf("Error processing %s: %v\n", name, err)
 			}
 		}
+	}
+
+	// Save state after processing
+	if err := m.saveState(); err != nil {
+		fmt.Printf("Warning: Could not save state: %v\n", err)
 	}
 
 	return nil
