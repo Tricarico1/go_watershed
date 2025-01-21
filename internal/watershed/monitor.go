@@ -150,7 +150,7 @@ func (m *Monitor) updateLastEmailTime(name string, t time.Time) error {
 	return nil
 }
 
-func (m *Monitor) checkAndNotify(name string, value float64) {
+func (m *Monitor) checkAndNotify(name string, value float64, timestamp time.Time) {
 	envName := strings.ReplaceAll(strings.ToUpper(name), " ", "_")
 	threshold := getThresholdFromEnv(envName)
 
@@ -175,19 +175,25 @@ func (m *Monitor) checkAndNotify(name string, value float64) {
 			return
 		}
 
+		// Format timestamp in EST
+		estTime := timestamp.Add(-5 * time.Hour)
+		timeStr := estTime.Format("2006-01-02 15:04:05 EST")
+
 		subject := fmt.Sprintf("%s Alert", name)
-		body := fmt.Sprintf("%s has reached %.2f (Acceptable range: %.2f to %.2f)",
-			name, value, threshold.min, threshold.max)
+		body := fmt.Sprintf("%s has reached %.2f at %s\n(Acceptable range: %.2f to %.2f)",
+			name, value, timeStr, threshold.min, threshold.max)
 
 		if err := m.sendEmailSES(subject, body); err != nil {
 			fmt.Printf("Error sending email for %s: %v\n", name, err)
-		} else {
-			// Update with new time
-			if err := m.updateLastEmailTime(name, time.Now()); err != nil {
-				fmt.Printf("Warning: Failed to update last email time: %v\n", err)
-			}
-			fmt.Printf("Alert email sent for %s (value: %.2f)\n", name, value)
+			return // Don't update last email time if sending failed
 		}
+
+		// Update with new time
+		if err := m.updateLastEmailTime(name, time.Now()); err != nil {
+			fmt.Printf("Warning: Failed to update last email time: %v\n", err)
+			return
+		}
+		fmt.Printf("Alert email sent for %s (value: %.2f)\n", name, value)
 	}
 }
 
@@ -281,7 +287,7 @@ func (m *Monitor) fetchTimeSeriesData(name, resultID string) error {
 		fmt.Printf("Value: %.2f\n", value)
 		fmt.Println("-------------------")
 
-		m.checkAndNotify(name, value)
+		m.checkAndNotify(name, value, utcTime)
 	}
 
 	return nil
@@ -295,16 +301,39 @@ func (m *Monitor) loadState() error {
 
 	result, err := m.s3Client.GetObject(input)
 	if err != nil {
-		// It's ok if the file doesn't exist yet
-		return nil
+		// If the file doesn't exist, that's okay - we'll start fresh
+		if strings.Contains(err.Error(), "NoSuchKey") {
+			fmt.Println("No existing state found, starting fresh")
+			m.lastEmailSent = make(map[string]time.Time)
+			return nil
+		}
+		return fmt.Errorf("error loading state from S3: %v", err)
 	}
 	defer result.Body.Close()
 
+	// Reset the map before loading
+	m.lastEmailSent = make(map[string]time.Time)
+
 	decoder := json.NewDecoder(result.Body)
-	return decoder.Decode(&m.lastEmailSent)
+	if err := decoder.Decode(&m.lastEmailSent); err != nil {
+		return fmt.Errorf("error decoding state: %v", err)
+	}
+
+	// Print current state for debugging
+	fmt.Println("Loaded state from S3:")
+	for k, v := range m.lastEmailSent {
+		fmt.Printf("- %s: last email sent at %v\n", k, v)
+	}
+
+	return nil
 }
 
 func (m *Monitor) saveState() error {
+	if len(m.lastEmailSent) == 0 {
+		fmt.Println("No state to save")
+		return nil
+	}
+
 	data, err := json.Marshal(m.lastEmailSent)
 	if err != nil {
 		return fmt.Errorf("error marshaling state: %v", err)
@@ -320,15 +349,20 @@ func (m *Monitor) saveState() error {
 	if err != nil {
 		return fmt.Errorf("error saving state to S3: %v", err)
 	}
+
+	fmt.Println("Successfully saved state to S3")
 	return nil
 }
 
 func (m *Monitor) RunOnce() error {
+	fmt.Println("Starting monitor run...")
+
 	// Load state at start
 	if err := m.loadState(); err != nil {
 		fmt.Printf("Warning: Could not load state: %v\n", err)
 	}
 
+	fmt.Println("Fetching measurement IDs...")
 	measurements, err := m.fetchResultID()
 	if err != nil {
 		return fmt.Errorf("error fetching measurements: %v", err)
@@ -344,18 +378,27 @@ func (m *Monitor) RunOnce() error {
 		"Relative humidity",
 	}
 
+	fmt.Printf("Found %d measurements, processing...\n", len(measurements))
+
+	successCount := 0
 	for _, name := range desiredMeasurements {
 		if resultID, ok := measurements[name]; ok {
+			fmt.Printf("Processing %s...\n", name)
 			if err := m.fetchTimeSeriesData(name, resultID); err != nil {
 				fmt.Printf("Error processing %s: %v\n", name, err)
+				continue
 			}
+			successCount++
 		}
 	}
+
+	fmt.Printf("Successfully processed %d/%d measurements\n", successCount, len(desiredMeasurements))
 
 	// Save state after processing
 	if err := m.saveState(); err != nil {
 		fmt.Printf("Warning: Could not save state: %v\n", err)
 	}
 
+	fmt.Println("Monitor run completed")
 	return nil
 }
